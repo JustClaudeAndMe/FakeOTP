@@ -1,9 +1,10 @@
 """
 OTP Relay API
 -------------
-POST/GET  /sendotp/{service}?number=...&sms=...
+GET/POST  /sendotp/{service}?number=...&sms=...
 GET       /poll
 DELETE    /poll
+GET       /health
 """
 
 import itertools
@@ -70,6 +71,23 @@ def _extract_otp(sms: str) -> Optional[str]:
     """Best-effort OTP extraction. Purely informational."""
     m = OTP_RE.search(sms or "")
     return m.group(0) if m else None
+
+
+# --------------------------------------------------------------------------
+# Root
+# --------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "name": "OTP Relay API",
+        "endpoints": {
+            "send": "GET/POST /sendotp/{service}?number=...&sms=...",
+            "poll": "GET /poll",
+            "clear": "DELETE /poll",
+            "health": "GET /health",
+        },
+        "auth": "X-API-Key header required if API_KEY env var is set",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -157,7 +175,20 @@ def clear_poll():
     return {"ok": True, "cleared": cleared}
 
 
+# --------------------------------------------------------------------------
+# /health
+# --------------------------------------------------------------------------
 @app.get("/health")
 def health():
     with _lock:
         return {"ok": True, "stored": len(_messages)}
+
+
+# --------------------------------------------------------------------------
+# Local dev / Render entrypoint
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
