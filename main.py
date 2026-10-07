@@ -2,15 +2,16 @@
 OTP Relay API
 -------------
 GET/POST  /sendotp/{service}?number=...&sms=...
-GET       /poll
+GET       /poll                              -> all messages, immediate
+GET       /poll?num=+XXXXXXXXXXX             -> long-poll for that number
 DELETE    /poll
 GET       /health
 """
 
+import asyncio
 import itertools
 import os
 import re
-import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,7 +20,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # --------------------------------------------------------------------------
 # Optional API key. Set the API_KEY env var to lock the whole thing down.
-# If it is not set, the API is open.
 # --------------------------------------------------------------------------
 API_KEY = os.getenv("API_KEY")
 
@@ -29,7 +29,7 @@ def require_key(x_api_key: Optional[str] = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
-app = FastAPI(title="OTP Relay API", version="1.0.0")
+app = FastAPI(title="OTP Relay API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,12 +39,14 @@ app.add_middleware(
 )
 
 # --------------------------------------------------------------------------
-# In-memory store
+# In-memory store (single process, single event loop)
 # --------------------------------------------------------------------------
-_lock = threading.Lock()
 _messages: list[dict] = []
 _next_id = itertools.count(1)
-MAX_STORED = 500  # keep only the newest N messages
+MAX_STORED = 500
+
+# number -> list of asyncio.Event, one per waiting /poll request
+_waiters: dict[str, list[asyncio.Event]] = {}
 
 OTP_RE = re.compile(r"\b\d{4,8}\b")
 
@@ -56,10 +58,7 @@ def _now() -> str:
 def _clean_number(raw: str) -> str:
     """
     Normalize a phone number.
-
-    Important: in a query string `+` is decoded as a space, so
-    `?number=+244996418946` actually arrives as ` 244996418946`.
-    This puts it back the way you meant it.
+    In a query string `+` decodes to a space, so we fix that here.
     """
     n = re.sub(r"[\s\-().]", "", raw or "")
     if n and not n.startswith("+"):
@@ -68,7 +67,6 @@ def _clean_number(raw: str) -> str:
 
 
 def _extract_otp(sms: str) -> Optional[str]:
-    """Best-effort OTP extraction. Purely informational."""
     m = OTP_RE.search(sms or "")
     return m.group(0) if m else None
 
@@ -82,7 +80,8 @@ def root():
         "name": "OTP Relay API",
         "endpoints": {
             "send": "GET/POST /sendotp/{service}?number=...&sms=...",
-            "poll": "GET /poll",
+            "poll_all": "GET /poll",
+            "poll_wait": "GET /poll?num=+XXXXXXXXXXX",
             "clear": "DELETE /poll",
             "health": "GET /health",
         },
@@ -99,7 +98,7 @@ def root():
     dependencies=[Depends(require_key)],
     summary="Record an incoming OTP / SMS for a service",
 )
-def send_otp(
+async def send_otp(
     service: str,
     number: str = Query(..., description="Phone number that received the SMS"),
     sms: str = Query(..., description="Full text of the SMS"),
@@ -117,10 +116,13 @@ def send_otp(
         "received_at": _now(),
     }
 
-    with _lock:
-        _messages.append(record)
-        if len(_messages) > MAX_STORED:
-            del _messages[:-MAX_STORED]
+    _messages.append(record)
+    if len(_messages) > MAX_STORED:
+        del _messages[:-MAX_STORED]
+
+    # Wake up every long-polling /poll request waiting for this number
+    for ev in _waiters.get(clean, []):
+        ev.set()
 
     return {"ok": True, "message": record}
 
@@ -131,36 +133,80 @@ def send_otp(
 @app.get(
     "/poll",
     dependencies=[Depends(require_key)],
-    summary="Read every OTP that has been sent",
+    summary="Read OTPs. With ?num=... it long-polls until a new SMS arrives.",
 )
-def poll(
+async def poll(
     service: Optional[str] = Query(None, description="Filter by service name"),
-    number: Optional[str] = Query(None, description="Filter by phone number"),
-    since_id: int = Query(0, ge=0, description="Only return messages with id > since_id"),
+    num: Optional[str] = Query(
+        None,
+        description="Phone number to long-poll for. Blocks until a new SMS arrives (or timeout).",
+    ),
+    number: Optional[str] = Query(None, description="Alias for 'num'"),
+    since_id: int = Query(
+        0, ge=0, description="Only return messages with id > since_id"
+    ),
     limit: int = Query(100, ge=1, le=500, description="Max messages to return"),
+    timeout: float = Query(
+        30.0,
+        ge=0,
+        le=300,
+        description="Max seconds to wait when num/number is set. 0 = return immediately.",
+    ),
 ):
-    with _lock:
-        snapshot = list(_messages)
+    target_raw = num or number
+    target = _clean_number(target_raw) if target_raw else None
+
+    def snapshot() -> list[dict]:
+        msgs = _messages
+        if service:
+            want = service.strip().lower()
+            msgs = [m for m in msgs if m["service"] == want]
+        if target:
+            msgs = [m for m in msgs if m["number"] == target]
+        if since_id:
+            msgs = [m for m in msgs if m["id"] > since_id]
+        return msgs[-limit:]
+
+    # No specific number -> return everything right away
+    if not target:
+        msgs = snapshot()
         latest_id = _messages[-1]["id"] if _messages else 0
+        return {"count": len(msgs), "latest_id": latest_id, "messages": msgs}
 
-    if service:
-        want = service.strip().lower()
-        snapshot = [m for m in snapshot if m["service"] == want]
+    # Specific number -> long-poll until a new message arrives (or timeout)
+    existing = snapshot()
+    if existing or timeout == 0:
+        latest_id = _messages[-1]["id"] if _messages else 0
+        return {
+            "count": len(existing),
+            "latest_id": latest_id,
+            "messages": existing,
+            "waited": False,
+        }
 
-    if number:
-        want_num = _clean_number(number)
-        snapshot = [m for m in snapshot if m["number"] == want_num]
+    ev = asyncio.Event()
+    _waiters.setdefault(target, []).append(ev)
+    try:
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+            waited = True
+        except asyncio.TimeoutError:
+            waited = False
 
-    if since_id:
-        snapshot = [m for m in snapshot if m["id"] > since_id]
-
-    snapshot = snapshot[-limit:]
-
-    return {
-        "count": len(snapshot),
-        "latest_id": latest_id,
-        "messages": snapshot,
-    }
+        msgs = snapshot()
+        latest_id = _messages[-1]["id"] if _messages else 0
+        return {
+            "count": len(msgs),
+            "latest_id": latest_id,
+            "messages": msgs,
+            "waited": waited,
+        }
+    finally:
+        lst = _waiters.get(target)
+        if lst and ev in lst:
+            lst.remove(ev)
+        if lst is not None and not lst:
+            _waiters.pop(target, None)
 
 
 @app.delete(
@@ -168,25 +214,21 @@ def poll(
     dependencies=[Depends(require_key)],
     summary="Clear the inbox",
 )
-def clear_poll():
-    with _lock:
-        cleared = len(_messages)
-        _messages.clear()
+async def clear_poll():
+    cleared = len(_messages)
+    _messages.clear()
     return {"ok": True, "cleared": cleared}
 
 
-# --------------------------------------------------------------------------
-# /health
-# --------------------------------------------------------------------------
 @app.get("/health")
-def health():
-    with _lock:
-        return {"ok": True, "stored": len(_messages)}
+async def health():
+    return {
+        "ok": True,
+        "stored": len(_messages),
+        "waiters": sum(len(v) for v in _waiters.values()),
+    }
 
 
-# --------------------------------------------------------------------------
-# Local dev / Render entrypoint
-# --------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
 
